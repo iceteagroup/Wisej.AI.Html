@@ -30,8 +30,11 @@ namespace Wisej.AI.Html.Css
 	/// <remarks>
 	/// Supported: type, universal, id, class and attribute selectors (all operators and the <c>i</c>/<c>s</c>
 	/// flags), the four combinators, the structural and state pseudo-classes, and <c>:not()</c>, <c>:is()</c>,
-	/// <c>:where()</c> and <c>:has()</c>. Pseudo-elements and namespace prefixes are rejected with a
-	/// <see cref="FormatException"/>, so a style sheet rule that uses them is skipped instead of misapplied.
+	/// <c>:where()</c> and <c>:has()</c>. Pseudo-elements and namespace prefixes are rejected, so a style sheet
+	/// rule that uses them is skipped instead of misapplied.
+	///
+	/// Syntax errors are recorded instead of thrown: style sheets are full of unsupported selectors and
+	/// <see cref="TryParse"/> must reject them without the cost of an exception each.
 	/// </remarks>
 	internal sealed class SelectorParser
 	{
@@ -44,6 +47,9 @@ namespace Wisej.AI.Html.Css
 
 		// the nesting of the pseudo-class arguments being parsed.
 		private int _nesting;
+
+		// the first syntax error, or null.
+		private string _error;
 
 		/// <summary>
 		/// Initializes a new instance of the <see cref="SelectorParser"/> class.
@@ -67,11 +73,9 @@ namespace Wisej.AI.Html.Css
 				throw new ArgumentNullException(nameof(selectors));
 
 			var parser = new SelectorParser(selectors);
-			var list = parser.ParseList(nested: false, relative: false, out _);
-
-			parser.SkipWhitespace();
-			if (parser._pos < parser._text.Length)
-				throw parser.Error("unexpected character");
+			var list = parser.ParseAll();
+			if (list == null)
+				throw new FormatException(parser._error);
 
 			return list;
 		}
@@ -83,17 +87,30 @@ namespace Wisej.AI.Html.Css
 		/// <returns>The parsed list, or <c>null</c>.</returns>
 		public static SelectorList TryParse(string selectors)
 		{
-			try
-			{
-				return Parse(selectors);
-			}
-			catch (FormatException)
-			{
+			if (selectors == null)
 				return null;
-			}
+
+			return new SelectorParser(selectors).ParseAll();
 		}
 
 		#region Grammar
+
+		/// <summary>
+		/// Parses the whole text as a selector list.
+		/// </summary>
+		/// <returns>The list, or <c>null</c> on a syntax error.</returns>
+		private SelectorList ParseAll()
+		{
+			var list = ParseList(nested: false, relative: false, out _);
+			if (list == null)
+				return null;
+
+			SkipWhitespace();
+			if (_pos < _text.Length)
+				return Fail<SelectorList>("unexpected character");
+
+			return list;
+		}
 
 		/// <summary>
 		/// Parses a comma separated list of complex selectors.
@@ -101,7 +118,7 @@ namespace Wisej.AI.Html.Css
 		/// <param name="nested">Whether the list is the argument of a pseudo-class and ends at <c>)</c>.</param>
 		/// <param name="relative">Whether the selectors are relative (the argument of <c>:has()</c>).</param>
 		/// <param name="relativeCombinator">Receives the leading combinator of the first relative selector.</param>
-		/// <returns>The list.</returns>
+		/// <returns>The list, or <c>null</c> on a syntax error.</returns>
 		private SelectorList ParseList(bool nested, bool relative, out char relativeCombinator)
 		{
 			var selectors = new List<ComplexSelector>();
@@ -117,7 +134,11 @@ namespace Wisej.AI.Html.Css
 					SkipWhitespace();
 				}
 
-				selectors.Add(ParseComplex());
+				var complex = ParseComplex();
+				if (complex == null)
+					return null;
+
+				selectors.Add(complex);
 				SkipWhitespace();
 
 				if (_pos < _text.Length && _text[_pos] == ',')
@@ -129,7 +150,7 @@ namespace Wisej.AI.Html.Css
 				if (_pos >= _text.Length || (nested && _text[_pos] == ')'))
 					break;
 
-				throw Error("expected ',' or the end of the selector");
+				return Fail<SelectorList>("expected ',' or the end of the selector");
 			}
 
 			return new SelectorList(selectors);
@@ -138,10 +159,14 @@ namespace Wisej.AI.Html.Css
 		/// <summary>
 		/// Parses a complex selector: compound selectors joined by combinators.
 		/// </summary>
-		/// <returns>The complex selector.</returns>
+		/// <returns>The complex selector, or <c>null</c> on a syntax error.</returns>
 		private ComplexSelector ParseComplex()
 		{
-			var compounds = new List<CompoundSelector> { ParseCompound() };
+			var first = ParseCompound();
+			if (first == null)
+				return null;
+
+			var compounds = new List<CompoundSelector> { first };
 			var combinators = new List<char>();
 
 			while (true)
@@ -167,11 +192,15 @@ namespace Wisej.AI.Html.Css
 				}
 				else
 				{
-					throw Error("unexpected character");
+					return Fail<ComplexSelector>("unexpected character");
 				}
 
+				var compound = ParseCompound();
+				if (compound == null)
+					return null;
+
 				combinators.Add(combinator);
-				compounds.Add(ParseCompound());
+				compounds.Add(compound);
 			}
 
 			return new ComplexSelector(compounds, combinators);
@@ -180,7 +209,7 @@ namespace Wisej.AI.Html.Css
 		/// <summary>
 		/// Parses a compound selector.
 		/// </summary>
-		/// <returns>The compound selector.</returns>
+		/// <returns>The compound selector, or <c>null</c> on a syntax error.</returns>
 		private CompoundSelector ParseCompound()
 		{
 			var compound = new CompoundSelector();
@@ -193,47 +222,58 @@ namespace Wisej.AI.Html.Css
 			}
 			else if (_pos < _text.Length && IsNameStart(_text[_pos]))
 			{
-				compound.Tag = ReadIdentifier().ToLowerInvariant();
+				var tag = ReadIdentifier();
+				if (tag == null)
+					return null;
+
+				compound.Tag = tag.ToLowerInvariant();
 				any = true;
 			}
 
 			if (_pos < _text.Length && _text[_pos] == '|')
-				throw Error("namespace prefixes are not supported");
+				return Fail<CompoundSelector>("namespace prefixes are not supported");
 
 			while (_pos < _text.Length)
 			{
 				var c = _text[_pos];
+				SimpleSelector condition;
 
 				if (c == '#')
 				{
 					_pos++;
-					compound.Conditions.Add(new IdSelector(ReadIdentifier()));
+					var id = ReadIdentifier();
+					condition = id == null ? null : new IdSelector(id);
 				}
 				else if (c == '.')
 				{
 					_pos++;
-					compound.Conditions.Add(new ClassSelector(ReadIdentifier()));
+					var name = ReadIdentifier();
+					condition = name == null ? null : new ClassSelector(name);
 				}
 				else if (c == '[')
 				{
 					_pos++;
-					compound.Conditions.Add(ParseAttribute());
+					condition = ParseAttribute();
 				}
 				else if (c == ':')
 				{
 					_pos++;
-					compound.Conditions.Add(ParsePseudoClass());
+					condition = ParsePseudoClass();
 				}
 				else
 				{
 					break;
 				}
 
+				if (condition == null)
+					return null;
+
+				compound.Conditions.Add(condition);
 				any = true;
 			}
 
 			if (!any)
-				throw Error("expected a selector");
+				return Fail<CompoundSelector>("expected a selector");
 
 			return compound;
 		}
@@ -241,11 +281,14 @@ namespace Wisej.AI.Html.Css
 		/// <summary>
 		/// Parses an attribute selector after <c>[</c>.
 		/// </summary>
-		/// <returns>The attribute selector.</returns>
+		/// <returns>The attribute selector, or <c>null</c> on a syntax error.</returns>
 		private SimpleSelector ParseAttribute()
 		{
 			SkipWhitespace();
-			var name = ReadIdentifier().ToLowerInvariant();
+			var name = ReadIdentifier()?.ToLowerInvariant();
+			if (name == null)
+				return null;
+
 			SkipWhitespace();
 
 			if (Peek() == ']')
@@ -267,11 +310,14 @@ namespace Wisej.AI.Html.Css
 			}
 			else
 			{
-				throw Error("invalid attribute selector");
+				return Fail<SimpleSelector>("invalid attribute selector");
 			}
 
 			SkipWhitespace();
 			var value = Peek() == '"' || Peek() == '\'' ? ReadString() : ReadIdentifier();
+			if (value == null)
+				return null;
+
 			SkipWhitespace();
 
 			var ignoreCase = false;
@@ -283,7 +329,7 @@ namespace Wisej.AI.Html.Css
 			}
 
 			if (Peek() != ']')
-				throw Error("expected ']'");
+				return Fail<SimpleSelector>("expected ']'");
 
 			_pos++;
 			return new AttributeSelector(name, op, value, ignoreCase);
@@ -292,13 +338,15 @@ namespace Wisej.AI.Html.Css
 		/// <summary>
 		/// Parses a pseudo-class after <c>:</c>.
 		/// </summary>
-		/// <returns>The pseudo-class selector.</returns>
+		/// <returns>The pseudo-class selector, or <c>null</c> on a syntax error.</returns>
 		private SimpleSelector ParsePseudoClass()
 		{
 			if (Peek() == ':')
-				throw Error("pseudo-elements are not supported");
+				return Fail<SimpleSelector>("pseudo-elements are not supported");
 
-			var name = ReadIdentifier().ToLowerInvariant();
+			var name = ReadIdentifier()?.ToLowerInvariant();
+			if (name == null)
+				return null;
 
 			switch (name)
 			{
@@ -307,13 +355,13 @@ namespace Wisej.AI.Html.Css
 				case "after":
 				case "first-line":
 				case "first-letter":
-					throw Error("pseudo-elements are not supported");
+					return Fail<SimpleSelector>("pseudo-elements are not supported");
 			}
 
 			if (Peek() != '(')
 			{
 				if (!PseudoClassSelector.IsSupported(name) || name.StartsWith("nth-", StringComparison.Ordinal))
-					throw Error("unsupported pseudo-class :" + name);
+					return Fail<SimpleSelector>("unsupported pseudo-class :" + name);
 
 				return new PseudoClassSelector(name);
 			}
@@ -323,7 +371,7 @@ namespace Wisej.AI.Html.Css
 
 			// nested pseudo-classes recurse when parsed and matched: bound them to protect the stack.
 			if (++_nesting > MaxNesting)
-				throw Error("selector nested too deeply");
+				return Fail<SimpleSelector>("selector nested too deeply");
 
 			switch (name)
 			{
@@ -332,11 +380,18 @@ namespace Wisej.AI.Html.Css
 				case "where":
 				case "matches":
 				case "any":
-					result = new LogicalSelector(name == "matches" || name == "any" ? "is" : name, ParseList(nested: true, relative: false, out _));
+					var arguments = ParseList(nested: true, relative: false, out _);
+					if (arguments == null)
+						return null;
+
+					result = new LogicalSelector(name == "matches" || name == "any" ? "is" : name, arguments);
 					break;
 
 				case "has":
 					var list = ParseList(nested: true, relative: true, out var combinator);
+					if (list == null)
+						return null;
+
 					result = new LogicalSelector(name, list, combinator);
 					break;
 
@@ -344,17 +399,19 @@ namespace Wisej.AI.Html.Css
 				case "nth-last-child":
 				case "nth-of-type":
 				case "nth-last-of-type":
-					ParseNth(out var a, out var b);
+					if (!ParseNth(out var a, out var b))
+						return null;
+
 					result = new PseudoClassSelector(name, a, b);
 					break;
 
 				default:
-					throw Error("unsupported pseudo-class :" + name + "()");
+					return Fail<SimpleSelector>("unsupported pseudo-class :" + name + "()");
 			}
 
 			SkipWhitespace();
 			if (Peek() != ')')
-				throw Error("expected ')'");
+				return Fail<SimpleSelector>("expected ')'");
 
 			_pos++;
 			_nesting--;
@@ -366,7 +423,8 @@ namespace Wisej.AI.Html.Css
 		/// </summary>
 		/// <param name="a">Receives the step.</param>
 		/// <param name="b">Receives the offset.</param>
-		private void ParseNth(out int a, out int b)
+		/// <returns><c>true</c> when the expression is valid.</returns>
+		private bool ParseNth(out int a, out int b)
 		{
 			SkipWhitespace();
 
@@ -380,29 +438,34 @@ namespace Wisej.AI.Html.Css
 			{
 				a = 2;
 				b = 1;
-				return;
+				return true;
 			}
 
 			if (expression == "even")
 			{
 				a = 2;
 				b = 0;
-				return;
+				return true;
 			}
 
 			var n = expression.IndexOf('n');
 			if (n < 0)
 			{
 				a = 0;
-				b = ParseInteger(expression);
-				return;
+				return ParseInteger(expression, out b);
 			}
 
+			b = 0;
 			var step = expression.Substring(0, n);
-			a = step == "" || step == "+" ? 1 : step == "-" ? -1 : ParseInteger(step);
+			if (step == "" || step == "+")
+				a = 1;
+			else if (step == "-")
+				a = -1;
+			else if (!ParseInteger(step, out a))
+				return false;
 
 			var offset = expression.Substring(n + 1);
-			b = offset.Length == 0 ? 0 : ParseInteger(offset);
+			return offset.Length == 0 || ParseInteger(offset, out b);
 		}
 
 		#endregion
@@ -448,7 +511,7 @@ namespace Wisej.AI.Html.Css
 		/// <summary>
 		/// Reads a CSS identifier, decoding escapes.
 		/// </summary>
-		/// <returns>The identifier.</returns>
+		/// <returns>The identifier, or <c>null</c> on a syntax error.</returns>
 		private string ReadIdentifier()
 		{
 			var sb = new StringBuilder();
@@ -473,7 +536,7 @@ namespace Wisej.AI.Html.Css
 			}
 
 			if (sb.Length == 0)
-				throw Error("expected an identifier");
+				return Fail<string>("expected an identifier");
 
 			return sb.ToString();
 		}
@@ -551,23 +614,29 @@ namespace Wisej.AI.Html.Css
 		/// Parses a signed integer of an <c>an+b</c> expression.
 		/// </summary>
 		/// <param name="text">The text.</param>
-		/// <returns>The value.</returns>
-		private int ParseInteger(string text)
+		/// <param name="value">Receives the value.</param>
+		/// <returns><c>true</c> when the text is a valid integer.</returns>
+		private bool ParseInteger(string text, out int value)
 		{
-			if (!Int32.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var value))
-				throw Error("invalid an+b expression");
+			if (Int32.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value))
+				return true;
 
-			return value;
+			Fail<string>("invalid an+b expression");
+			return false;
 		}
 
 		/// <summary>
-		/// Creates the exception thrown for a syntax error.
+		/// Records a syntax error, keeping the first one.
 		/// </summary>
+		/// <typeparam name="T">The return type of the failing production.</typeparam>
 		/// <param name="message">The description of the error.</param>
-		/// <returns>The exception.</returns>
-		private FormatException Error(string message)
+		/// <returns><c>null</c>, so a production can fail with <c>return Fail&lt;T&gt;(...)</c>.</returns>
+		private T Fail<T>(string message) where T : class
 		{
-			return new FormatException($"Invalid selector \"{_text}\" at position {_pos}: {message}.");
+			if (_error == null)
+				_error = $"Invalid selector \"{_text}\" at position {_pos}: {message}.";
+
+			return null;
 		}
 
 		#endregion
